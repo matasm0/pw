@@ -36,9 +36,9 @@ backups in the same directory as itself. ~~This can be changed in the
 config file to any desired location~~ NOT YET IMPLEMENTED
 
 If the program cannot locate a password file, it will assume you are a
-new user, and will prompt you to create a password. ==THIS IS YOUR
+new user, and will prompt you to create a password. **THIS IS YOUR
 MASTER PASSWORD. Do not forget it or you will permanently lose
-access to your passwords.==
+access to your passwords.**
 
 Once completed and from that point onwards, the program will display
 a menu with several options. Inputting 'quit' at any point will take you back

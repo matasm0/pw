@@ -1,0 +1,709 @@
+#!/usr/bin/env python3
+
+#! python3
+
+import os, sys, secrets, pyperclip, subprocess, base64;
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+import cryptr
+from datetime import datetime, timedelta
+
+# -------------------------------- Variables -------------------------------- #
+
+verbose = 1
+origFile = ""
+header = ""
+
+width_user, width_pass, width_email = 10, 10, 9
+pwLen = 16
+
+emails = {
+    "j@g" : "john.b@gmail.com"
+}
+
+# Class to store the usernames, passwords, and emails of site
+class Pwd():
+    def __init__(self, s, u = "None", p = "None", e = "None", encrypt=True):
+      self.site = s
+      self.data = {}
+      self.data["User"] = u
+      self.data["Email"] = e
+      self.data["Password"] = Guard().encrypt(p) if encrypt else p
+    def toStr(self, display = True, indent = 0):
+        return "\n".join(self.toList(display, indent)) + "\n"
+    def toList(self, display = True, indent = 0):
+        return [' ' * indent + f'{x}: {y}' for x, y in self.data.items() if not display or (x != "Password" and y != "None")] # Python <3
+    def getPwd(self, display = False):
+        pw = Guard().decrypt(self.data["Password"].encode())
+        pyperclip.copy(pw)
+    def change(self, u = None, p = None, e = None, encrypt=True):
+        if u: self.data["User"] = u
+        if e: self.data["Email"] = e
+        if p: self.data["Password"] = Guard().encrypt(p) if encrypt else p
+
+# Class that holds all of the password objects
+class Pwds():
+    list = {}
+    def __new__(self):
+        if not hasattr(self, "instance"):
+            self.instance = super(Pwds, self).__new__(self)
+        return self.instance
+    
+    def add(self, site, pwd):
+        site = site.lower()
+        if site not in self.list:
+            self.list[site] = []
+        self.list[site].append(pwd)
+
+    # Assumes site exists
+    def remove(self, site, pwd):
+        site = site.lower()
+        self.list[site].pop(self.list[site].index(pwd))
+        if not self.list[site]: del self.list[site]
+
+    def check(self, site):
+        return self.list.get(site.lower(), None)
+        # QOL Add a fuzzy check that takes in a site and returns the top most similar sites
+    
+# Special Exception class that lets us take a quit input from anywhere in the process
+class UserQuit(Exception):
+    pass
+
+# "Singleton" object that handles all things input
+class Input():
+    def __new__(self):
+        if not hasattr(self, "instance"):
+            self.instance = super(Input, self).__new__(self)
+            self.queue = []
+        return self.instance
+
+    def read(self, *inputs, hasSpaces = False):
+        if inputs:
+            self.queue += [x.lstrip() for x in inputs]
+        else:
+            self.queue.append(input().lstrip())
+
+    # Returns the next input from the queue if it exists, otherwise prompts the user
+    # unless noPrompt is true.
+    def get(self, message = "", end = "\n", hasSpaces = False, clear = False, noPrompt = False):
+        if not self.queue:
+            if noPrompt: return None
+            print(message, end=end)
+            self.read(hasSpaces=hasSpaces)
+
+        if self.queue[0].lower() in ["quit", "q"]: 
+            self.queue.pop(0)
+            raise UserQuit()
+        toReturn = self.queue.pop(0)
+        if clear: self.clear()
+        return toReturn
+    
+    # If the next input is any form of yes or no, return true/false
+    # If it is none of those, will return true if not strict (skipping confirmation)
+    # or false if strict (input NEEDS to be a yes to proceed)
+    def confirm(self, message = "", strict = False, clear = False):
+        if not self.queue:
+            print(message)
+            self.read()
+        currInp = self.queue[0].lower()
+        if currInp in ["yes", "y"]:
+            self.queue.pop(0)
+            if clear: self.clear()
+            return True
+        if currInp in ["no", "n"]:
+            self.queue.pop(0)
+            if clear: self.clear()
+            return False
+        if currInp in ["quit", "q"]:
+            self.queue.pop(0)
+            if clear: self.clear()
+            raise UserQuit()
+        if clear: self.clear()
+        return not strict
+    
+    def clear(self):
+        self.queue = []
+
+# "Singleton" object that holds the global settings for the program
+class Settings():
+    def init(self): # Our fake singleton init method
+        # TODO Default directory should be hard coded
+        self.defaults = {
+            "pwdsDir" : "./",
+            "backupsDir" : "./backups/",
+            "pwdLength" : 12,
+            "shortEmails" : {},
+            "specialChars" : ""
+        }
+        self.cwd = None
+        self.pwFileName = None
+        self.pwFileDir = "./pwds.txt"
+        self.backupFileDir = "./backups/"
+        self.configDir = "./config.txt"
+        self.emails = emails
+    def __new__(self):
+        if not hasattr(self, "instance"):
+            self.instance = super(Settings, self).__new__(self)
+            self.init(self)
+        return self.instance
+
+# "Singleton" object responsible for handling sensitive encryption/decryption data.
+class Guard():
+    salt = b'o\xab\xb7\xeb\xcd\xbdo_Wx\x07"e\xe5)f'
+    kill = False
+    password = None
+    def __new__(self):
+        if not hasattr(self, "instance"):
+            self.instance = super(Guard, self).__new__(self)
+            self.f = None
+        return self.instance
+    
+    def isLoggedIn(self):
+        return self.password != None
+    
+    def getKey(self):
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            iterations=480000,
+            salt=self.salt
+        )
+        if not self.password:
+            self.authorize("Enter the master password: ")
+        key = base64.urlsafe_b64encode(kdf.derive(self.password.encode()))
+        if self.kill:
+            self.password = None
+        return key
+
+    def getEncrypter(self):
+        key = self.getKey()
+        return Fernet(key)
+    
+    def encrypt(self, data):
+        if not self.f:
+            self.f = self.getEncrypter()
+        token = self.f.encrypt(data.encode()) 
+        if self.kill:
+            self.f = None
+        return token.decode()
+
+    def decrypt(self, token):
+        if not self.f:
+            self.f = self.getEncrypter()
+        data = self.f.decrypt(token).decode()
+        if self.kill:
+            self.f = None
+        return data
+
+    def killF(self, shouldKill):
+        self.kill = shouldKill
+        if shouldKill:
+            self.f = None
+            self.password = None
+
+    def authorize(self, message=""):
+        # Credit to https://stackoverflow.com/a/49859175
+        if self.f: return True
+        if message: print(message)
+        subprocess.check_call(["stty", "-echo"])
+        self.password = input()
+        subprocess.check_call(["stty", "echo"])
+        if hasattr(Settings(), "masterPw") and Settings().masterPw:
+            temp = hashes.Hash(hashes.SHA256())
+            temp.update(self.password.encode())
+            return Settings().masterPw == temp.finalize()
+        return True
+    
+    # I dont like this
+    def getPwd(self):
+        if not self.password:
+            self.authorize("Please enter your password:")
+        temp = self.password # We may want to stay logged in here
+        key = self.getKey()
+        if not self.kill: self.password = temp
+        return key
+
+# -------------------------------------------------------------------------- #
+
+# Make sure this thing is doing what I think I told it to do
+def debug(message: str):
+    if verbose: print("--" + message)
+
+def sortPwds():
+    sites = Pwds().list.keys()
+    return sorted(sites)
+
+def save():
+    debug("Writing to save file at %s" %Settings().pwFileDir)
+    toWrite = header + "\n"
+    with open(Settings().pwFileDir, 'w') as f:
+        sites = sortPwds()
+        for site in sites:
+            accounts = Pwds().check(site)
+            toWrite += accounts[0].site + "\n"
+            for account in Pwds().check(site):
+                toWrite += account.toStr(False, 4) + "\n"
+        # f.write(toWrite.rstrip()) # TODO Error checking
+        encryptPwdsFile(toWrite.rstrip())
+
+# Generates a (hopefully) strong random password.
+# User can input special characters if the site does not accept all of them
+def gen(copy=True, specialInput = None):
+    debug("Generating password")
+    pwdChars = []
+    alph = "abcdefghijklmnopqrstuvwxyz"
+    nums = "1234567890"
+    special = specialInput or "@!\"#$%&'()*+,-./:;<=>?@[\]^_`{|}~"
+
+    while True:
+        pwdChars.append(alph.upper()[secrets.randbelow(len(alph))])
+        pwdChars.append(nums[secrets.randbelow(len(nums))])
+        pwdChars.append(special[secrets.randbelow(len(special))])
+
+        chars = alph + nums + special + alph.upper()
+        for _ in range(3, pwLen): # TODO Using pwLen
+            pwdChars.append(chars[secrets.randbelow(len(chars))])
+
+        pwd = ""
+        for _ in range(pwLen):
+            randInd = secrets.randbelow(len(pwdChars))
+            pwd += pwdChars[randInd]
+            pwdChars.pop(randInd)
+
+        print(f"\n{pwd}\n")
+        if Input().confirm("Is this password okay? (Y/N, or \"change\" for custom special characters)", True):
+            if copy: 
+                pyperclip.copy(pwd)
+                print("The password has been copied")
+                return pwd
+        if Input().get(noPrompt=True) == "change":
+            special = Input().get("Enter allowed special characters (no spaces)")
+
+def decryptPwdsFile():
+    # login()
+    contents = cryptr.decryptFile(key=Guard().getPwd(), inPath=Settings().pwFileDir, returnFile=True)[0].decode()
+    if debug:
+        with open("./pwds.decrypted", "w") as f:
+            f.write(contents)
+    return contents
+
+def encryptPwdsFile(fileContents):
+    cryptr.encryptFile(Guard().getPwd(), outPath=Settings().pwFileDir, contents=fileContents, hideOutputFileType=False)
+
+def readPwds(fileContents):
+    lines = [line.rstrip() for line in fileContents.split("\n")]
+    # TODO Error checking
+    debug(f"Read password file, {len(lines)} lines")
+
+    global header
+    header = lines[0]
+
+    counts = [0, 0]
+    for i in range(1, len(lines)):
+      # There's probably a better way to do this but we just check to see if the first
+      # character of the line isnt a space, that way we know if its the site name
+      if lines[i] and not lines[i][0].isspace():
+          currSite = lines[i]
+          counts[0] += 1
+          i += 1
+          while i < len(lines) and lines[i][0].isspace():
+              while i < len(lines) and lines[i] == "": i += 1 # Skip newlines if they somehow get here
+              if i >= len(lines): pass # TODO Raise exception
+              currLine = lines[i].lstrip().split(": ")
+              if currLine[0] not in ["User", "Email", "Password"]:
+                  pass # TODO Raise exception
+              if currLine[0] == "User":
+                  user = currLine[1]
+                  i += 1
+                  currLine = lines[i].lstrip().split(": ") # TODO Error checking
+              else: pass # TODO Raise exception
+              if currLine[0] == "Email":
+                  email = currLine[1]
+                  i += 1
+                  currLine = lines[i].lstrip().split(": ")
+              else: pass
+              if currLine[0] == "Password":
+                  password = currLine[1]
+                  i += 1
+              else: pass
+
+              while i < len(lines) and lines[i] == "": i += 1 # Skip newlines after the site details
+
+              currPwd = Pwd(s = currSite, u = user, p = password, e = email, encrypt = False)
+              Pwds().add(currSite, currPwd)
+              counts[1] += 1
+    debug(f"Got {counts[1]} accounts over {counts[0]} sites")
+
+# Give the user the option to choose if multiple accounts are present for one site
+def accountFromAccounts(accounts, message):
+    for i, account in enumerate(accounts):
+        message += f"\n\n{i + 1} - "
+        if not len(info := account.toList()):
+            message += "No user/email\n"
+        else:
+            message += info[0]
+            for j in range(1, len(info)):
+                message += "\n" + " " * (len(str(i)) + 3) + info[j]
+    inp = Input().get(message + "\n")
+    while not inp.isnumeric() or int(inp) > len(accounts) or inp == '0':
+        inp = Input().get(f"Please enter a valid number (1 - {len(accounts)})")
+    return int(inp) - 1
+
+def check():
+    debug("Checking sites")
+    if (site := Input().get("\nInput the site you want to check")).lower() == "q":
+        return
+    accounts = Pwds().check(site)
+    if accounts:
+        if len(accounts) == 1:
+            print(accounts[0].toStr(), end="")
+            accounts[0].getPwd()
+        else: # QOL user can type their username/email or the number
+            toPrint = "\nWhich account do you want to check?"
+            inp = accountFromAccounts(accounts, toPrint)
+            accounts[inp].getPwd()
+    else:
+        if Input().confirm("\nSite not found, do you want to add it? Y/N"):
+            return add(site)
+        else: return
+
+def add(site = None):
+    debug("Adding account")
+    if not site: site = Input().get("\nSite name: ", end="", hasSpaces=True)
+    accounts = Pwds().check(site)
+    es, us = None, None
+    if accounts:
+        es = set(acc.data["Email"].lower() for acc in accounts)
+        us = set(acc.data["User"].lower() for acc in accounts)
+    user = Input().get("Enter the username (leave blank if none): ", end="")
+    if us and user and user.lower() in us:
+        print("\n\n!!! Account with this username already exists !!!")
+        if Input().confirm("\nType y to change the existing account's details, n to keep making the new account, q to quit", True):
+            return change(site, username=user)
+        else:
+            print("Continuing making account with duplicate username")
+    email = Input().get("Enter the email (leave blank if none): ", end="")
+    if es and email and email.lower() in es:
+        print("\n\n!!! Account with this email already exists !!!")
+        if Input().confirm("\nType y to change the existing account's details, n to keep making the new account, q to quit", True):
+            return change(site, email=email)
+        else:
+            print("Continuing making account with duplicate email")
+    password = Input().get("Enter the password (required) or \"gen\" to generate one: ", end="")
+    if password == "gen": password = gen(copy=False)
+    toAdd = Pwd(site, user, password, email)
+    Pwds().add(site, toAdd)
+    save()
+
+def remove():
+    debug("Removing account")
+    site = Input().get("\nEnter site: ", end="")
+    while not (accounts := Pwds().check(site)):
+        site = Input().get("Site not found, re-enter site: ", end="")
+    
+    if len(accounts) == 1:
+        if Input().confirm(f"\nDelete this account?\n\n{accounts[0].toStr(indent=3)}", True):
+            Pwds().remove(site, accounts[0])
+        else: return print("Canceling")
+    else:
+        toPrint = "\nWhich account do you want to delete?"
+        inp = accountFromAccounts(accounts, toPrint)
+        if Input().confirm("\nType yes to confirm delete", True):
+            Pwds().remove(site, accounts[inp])
+        else: return print("Canceling")
+    print("Account removed")
+    save()
+
+
+def change(site = None, email = None, username = None):
+    debug("Changing account details")
+    if not site: site = Input().get("\nEnter site: ", end="")
+    while not (accounts := Pwds().check(site)):
+        site = Input().get("Site not found, re-enter site: ", end="")
+    
+    if email:
+        accounts = list(filter(lambda x: x.data["Email"] == email, accounts))
+    elif username:
+        accounts = list(filter(lambda x: x.data["User"] == username, accounts))
+
+    if len(accounts) == 1: inp = 0
+    else:
+        toPrint = "\nWhich account do you want to change?"
+        inp = accountFromAccounts(accounts, toPrint)
+
+    while Input().confirm("\nChanging username, email, or password (q to quit)?"):
+        change = Input().get("What are you changing (username, email, password)?").lower()
+        while change not in ["username", "email", "password"]:
+            change = Input().get("Type username, email, or password, or q to quit")
+        if change in ["username", "email"]: newThing = Input().get(f"Enter your new {change}: ", end="")
+        elif change == "password": newThing = Input().get(f"Enter your new password, or \"gen\" to generate one: ", end="")
+
+        if change == "username": accounts[inp].change(u=newThing)
+        elif change == "email": accounts[inp].change(e=newThing)
+        elif change == "password":
+            if newThing == "gen":
+                newThing = gen(False)
+            accounts[inp].change(p=newThing)
+
+        print(f"{change.capitalize()} changed!")
+        save()
+          
+def ohno():
+    if Input().confirm("\nAre you sure you want to undo all changes?", True):
+        with open(Settings().pwFileDir, 'w') as f:
+            f.write(origFile)
+            sys.exit()
+            # QOL Make ohno not exit. This would require deleting all singletons so they can be 
+            # reinitialized with the new (old) data
+    else: return print("Canceling")
+
+def restore():
+    pass
+    # QOL restore from backup in the program. Accept either a date (checks backup folder)
+    # or a path to a backup file
+
+def menuText():
+    menu = '''
+add    : add a new account to a new/existing site
+remove : remove an account from a site
+change : change a password/email/user for a site
+check  : check accounts for a site
+gen    : generate a password
+quit   : go home
+ohno   : Oh no... you messed up.
+'''
+    return menu
+
+
+def logout():
+    debug("Logout")
+    Guard().killF(True)
+
+# If we need to set up things like subprocesses or whatever to make this run in the background,
+# it will go here. But for now I will just run()
+def start():
+    debug("Start")
+
+def run():
+    options = {
+        "add" : add,
+        "remove" : remove,
+        "change" : change,
+        "check" : check,
+        "gen" : gen,
+        "ohno" : ohno,
+        "help" : lambda _: print("WIP")
+    }
+
+    try:
+        while True:
+            menu = menuText()
+            inp = Input().get(menu).lower()
+            if inp in options:
+                try:
+                    options[inp]()
+                except UserQuit:
+                    continue
+            else:
+                print("Please enter one of the options\n")
+                continue
+
+    except UserQuit:
+        sys.exit()
+
+def main():
+    backup()
+    init()
+    start()
+    run()
+
+def init():
+    # If the user just wants to generate a password, don't stop them
+    if len(sys.argv) > 1 and sys.argv[1] == "gen":
+        try: 
+            gen()
+            exit()
+        except UserQuit:
+            exit()
+    
+    # Make a new default config file if it doesn't exist
+    if not os.path.exists(Settings().configDir):
+        # createConfigFile()
+        toWrite = f'''# Directory for passwords/backups
+dir: {Settings().defaults["pwdsDir"]}
+
+# Length of generated passwords
+length: {Settings().defaults["pwdLength"]}
+
+# Email shorthands
+emails : {{}}'''
+        with open(Settings().configDir, "w") as f:
+            f.write(toWrite)
+
+    # TODO Read in config
+
+    # Make a new passwords file if needed
+    if not os.path.exists(Settings().pwFileDir):
+        print("Hi! It seems like you're new.")
+        # TODO We could have setting to keep the passwords file unencrypted so
+        # it can just be used
+        print("You will need a master password to access your other passwords.\nMake sure it is strong.\nIf you forget it, your passwords will be unrecoverable.")
+
+        newPw = ""
+        subprocess.check_call(["stty", "-echo"])
+        while True:
+            print("\nEnter a master password (input will be hidden)")
+            newPw = input()
+
+            print("\nRe-enter the master password")
+            checkPw = input()
+
+            if newPw == checkPw:
+                print("\nPassword set. Do not forget it (threat)")
+                break
+            
+            print("\nPasswords did not match.")
+        subprocess.check_call(["stty", "echo"])
+
+        Guard().password = newPw
+        key = Guard().getKey()
+        # If the file is empty, it obviously can't be encrypted, and thus can't be decrypted. We add a random value to the file so its never empty
+        cryptr.encryptFile(key=key, outPath=Settings().pwFileDir, contents=str(secrets.randbelow(99999999999999))+'\n', hideOutputFileType=False)
+        
+        if Input().confirm("\nDo you want to change the config? (yes/no)", True, True):
+            print("\nEnter the value(s) you want. Leave blank if default is okay. Q to quit without saving.")
+            pwdsDir = Input().get("Directory for passwords (default same as program)", clear=True)
+            backupsDir = Input().get("Directory for backups (default program directory/backups/)")
+            pwdLength = Input().get("Length of passwords (default 12, recommended 12+)", clear=True)
+            # TODO need the emails part
+            toWrite = f'''# Directory for passwords/backups
+dir: {pwdsDir or Settings().defaults["pwdsDir"]}
+
+# Length of generated passwords
+length: {pwdLength or Settings().defaults["pwdLength"]}
+
+# Email shorthands
+emails : {{}}'''
+            with open(Settings().configDir, "w") as f:
+                f.write(toWrite)
+
+            print("Config changed. Type \"config\" again to change it")
+    
+    # Take in all user inputs
+    elif len(sys.argv) > 1:
+        # User supplied their password?
+        if sys.argv[1] == "-l": # Haha funny way to take flags
+            Guard().password = sys.argv[2] # If the password is wrong, program should exit
+            if len(sys.argv) > 3: 
+                Input().read(*sys.argv[3:])
+                Input().read("q")
+        else:
+            Input().read(*sys.argv[1:])
+            Input().read("q") # QOL Idk make it so that it auto quits if it comes from sys args
+
+    login()
+        
+
+def login(pwd: str = None):
+    global origFile
+    if pwd: Guard().password = pwd
+    while True:
+        try:
+            if not Guard().isLoggedIn():
+                Guard().authorize("Enter your password:")
+            origFile = decryptPwdsFile()
+            readPwds(origFile)
+            break
+        except Exception as e:
+            if str(type(e)) == "<class 'cryptography.fernet.InvalidToken'>": # Foolproof
+                print("Password was invalid")
+                Guard().killF(True)
+            else:
+                raise
+    Guard().killF(False)
+
+# Creates and maintains backups
+def backup():
+    dateFormat = "%Y-%m-%d"
+    dailiesPath = os.path.join(Settings().backupFileDir, "day")
+    weekliesPath = os.path.join(Settings().backupFileDir, "week")
+    monthliesPath = os.path.join(Settings().backupFileDir, "month")
+    if not os.path.exists(Settings().backupFileDir):
+        os.makedirs(Settings().backupFileDir)
+    if not os.path.exists(dailiesPath):
+        os.makedirs(dailiesPath)
+    if not os.path.exists(weekliesPath):
+        os.makedirs(weekliesPath)
+    if not os.path.exists(monthliesPath):
+        os.makedirs(monthliesPath)
+
+    dailiesFiles = sorted(os.listdir(dailiesPath))
+    weekliesFiles = sorted(os.listdir(weekliesPath))
+    monthliesFiles = sorted(os.listdir(monthliesPath))
+
+    today = datetime.today()
+
+    # Create a temporary backup for this session
+    with open(os.path.join(Settings().backupFileDir, "pwds.backup"), "w") as f:
+        f.write(origFile)
+
+    # Create/maintain 1 monthly backup
+    if not monthliesFiles:
+        with open(os.path.join(monthliesPath, str(today.date()) + ".backup"), "w") as f:
+            f.write(origFile)
+    else:
+        file = monthliesFiles[0] # TODO Check that file is correct
+        day = datetime.strptime(file.split(".")[0], dateFormat)
+
+        # Check if monthly backup is 2 weeks older than first weekly backup
+        if not weekliesFiles:
+            with open(os.path.join(monthliesPath, str(today.date()) + ".backup"), "w") as f:
+                f.write(origFile)
+        else:
+            if (day + timedelta(days=14) <= datetime.strptime(weekliesFiles[0].split(".")[0], dateFormat)):
+                os.remove(os.path.join(monthliesPath, file))
+                temp = ""
+                with open(os.path.join(weekliesPath, weekliesFiles[0]), "r") as f:
+                    temp = f.read()
+                with open(os.path.join(monthliesPath, weekliesFiles[0]), "w") as f:
+                    f.write(temp)
+
+    # Create/maintain 2 weekly backups
+    if len(weekliesFiles) < 2:
+        with open(os.path.join(weekliesPath, str(today.date()) + ".backup"), "w") as f:
+            f.write(origFile)
+    else:
+        file = weekliesFiles[-1]
+        day = datetime.strptime(file.split(".")[0], dateFormat)
+        if not dailiesFiles:
+            with open(os.path.join(weekliesPath, str(today.date()) + ".backup"), "w") as f:
+                f.write(origFile)
+        else:
+            if (day + timedelta(days=7) <= datetime.strptime(dailiesFiles[0].split(".")[0], dateFormat)):
+                if len(weekliesFiles) >= 2:
+                    os.remove(os.path.join(weekliesPath, weekliesFiles[0]))
+                temp = ""
+                with open(os.path.join(dailiesPath, dailiesFiles[0]), "r") as f:
+                    temp = f.read()
+                with open(os.path.join(weekliesPath, dailiesFiles[0]), "w") as f:
+                    f.write(temp)
+
+    # Create/maintain 2 daily backups
+    if not dailiesFiles:
+        with open(os.path.join(dailiesPath, str(today.date()) + ".backup"), "w") as f:
+            f.write(origFile)
+    else:
+        file = dailiesFiles[-1]
+        day = datetime.strptime(file.split(".")[0], dateFormat)
+        if day + timedelta(days=1) <= datetime.today():
+            if len(dailiesFiles) >= 2:
+                os.remove(os.path.join(dailiesPath, dailiesFiles[0]))
+        with open(os.path.join(dailiesPath, str(today.date()) + ".backup"), "w") as f:
+            f.write(origFile)
+
+
+
+
+
+main()
